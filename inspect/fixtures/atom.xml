@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Atom Only</title>
+  <subtitle>The other dialect, which real shows do use.</subtitle>
+  <link rel="alternate" href="https://atom.example.com/"/>
+  <link rel="self" href="https://atom.example.com/feed.xml"/>
+
+  <entry>
+    <title>Newer entry</title>
+    <id>urn:uuid:0000-0002</id>
+    <published>2026-07-02T12:00:00Z</published>
+    <summary>The summary tag, not description.</summary>
+    <link rel="alternate" href="https://atom.example.com/2"/>
+    <link rel="enclosure" href="https://cdn.atom.example.com/2.mp3"
+          length="4000000" type="audio/mpeg"/>
+  </entry>
+
+  <entry>
+    <title>Older entry</title>
+    <id>urn:uuid:0000-0001</id>
+    <updated>2026-07-01T12:00:00Z</updated>
+    <summary>Only &lt;updated&gt;, no &lt;published&gt;.</summary>
+    <link rel="enclosure" href="https://cdn.atom.example.com/1.mp3" type="audio/mpeg"/>
+  </entry>
+</feed>
