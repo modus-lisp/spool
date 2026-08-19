@@ -20,7 +20,9 @@
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
     (ql:quickload '(:mcclim :mcclim-render :pigment))
-    (asdf:load-asd "/home/claude/glass/backend/mcclim-glass.asd")
+    ;; glass sits beside spool; resolve it from this file so any checkout works.
+    (asdf:load-asd (merge-pathnames "../../glass/backend/mcclim-glass.asd"
+                                    *load-truename*))
     (asdf:load-system :mcclim-glass)
     (asdf:load-system :spool/app)))
 
