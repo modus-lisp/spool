@@ -33,7 +33,8 @@
            #:cache-path #:cached-p #:download #:download-async #:downloading-p
            #:download-progress #:cache-size #:evict
            ;; playback
-           #:player #:make-player #:player-p #:player-source #:player-episode
+           #:player #:make-player #:player-p #:player-source #:player-episode #:player-title
+           #:play-file
            #:player-state #:player-position #:player-duration #:player-error
            #:play #:pause #:resume #:toggle #:stop #:seek #:skip #:next-episode
            #:player-report))

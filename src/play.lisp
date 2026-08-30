@@ -37,7 +37,8 @@ phone call to every listener, which is the mistake glass's mixer exists to avoid
 
 (defstruct (player (:constructor %make-player))
   (episode nil)
-  (path nil)                            ; the cached file
+  (title nil)                           ; what to call this, when there is no episode to ask
+  (path nil)                            ; the cached file, or a file somebody named
   (bytes nil)                           ; the file, held so a seek needn't re-read it
   (reed nil)                            ; the reed player, or NIL between seeks
   (state :idle)                         ; :idle :loading :playing :paused :ended :error
@@ -78,6 +79,44 @@ and never touched again."
                               :frame-samples (player-frame-samples p)
                               :gain (player-gain p)
                               :start start)))
+
+(defun play-file (p path &key (from 0) title seconds)
+  "Play a local audio FILE on P.  Returns the path, or NIL if it could not be read.
+
+   PLAY is the same thing with three podcast-shaped questions in front of it: where the cache
+   put the download, what the feed claimed the duration was, and how far in you had got last
+   time.  A file on disk answers the first by being a path and leaves the other two to the
+   caller — so this is not a second player, it is the same one without the questions that only
+   a subscription can answer.
+
+   TITLE and SECONDS are what the caller knows and this cannot: a filename is not a title and
+   a duration needs the whole file decoded to be sure.  Both are optional and both are only
+   ever reported, never used to decide anything — a NIL duration means seeking refuses, which
+   is honest, rather than seeking against a guess."
+  (let ((bytes (ignore-errors (%load-bytes path))))
+    (unless (and bytes (plusp (length bytes)))
+      (sb-thread:with-mutex ((player-lock p))
+        (setf (player-state p) :error
+              (player-error p) (format nil "cannot read ~a" (file-namestring path))))
+      (return-from play-file nil))
+    (sb-thread:with-mutex ((player-lock p))
+      (setf (player-state p) :loading
+            (player-error p) nil
+            ;; NO EPISODE.  Everything that reads this slot has to tolerate NIL already —
+            ;; the player is :IDLE before anything plays — and inventing a fake episode to
+            ;; satisfy a UI would put a lie where a library lookup will later go looking.
+            (player-episode p) nil
+            (player-path p) path
+            (player-bytes p) bytes
+            (player-duration p) seconds
+            (player-title p) (or title (pathname-name (pathname path)))
+            (player-emitted p) 0
+            (player-base p) 0.0d0)
+      (if (and from (plusp from) seconds (< from (- seconds 5)))
+          (%seek-locked p from)
+          (%open-reed p))
+      (setf (player-state p) :playing))
+    path))
 
 (defun play (p episode &key (from nil) (lib (library)))
   "Play EPISODE on P, resuming from the remembered position unless FROM says where.
