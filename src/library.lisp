@@ -11,20 +11,73 @@
 ;;;; subscriptions, not just their URLs, so the app opens instantly and offline; a
 ;;;; refresh is then something the user asks for, not something they wait through.
 ;;;;
-;;;; The cache does NOT live under the home directory.  Episodes run 25-190 MB (a
-;;;; three-hour interview is 186 MB), and this box's root filesystem has single-digit
-;;;; gigabytes free — thirty episodes would fill it and take the desktop, the web
-;;;; service and the git server down with it.  So the default root is on the big
-;;;; volume, and SPOOL_ROOT overrides it.
+;;;; The cache PREFERS not to live under the home directory.  Episodes run 25-190 MB
+;;;; (a three-hour interview is 186 MB), and this box's root filesystem has
+;;;; single-digit gigabytes free — thirty episodes would fill it and take the desktop,
+;;;; the web service and the git server down with it.  So /mnt/lisp/spool is used when
+;;;; that volume is really mounted and writable.
+;;;;
+;;;; PREFERS, because it used to REQUIRE.  The root was a hard-coded absolute path, so
+;;;; spool could not start at all on a machine without /mnt — which is every machine
+;;;; except that one, including a CI runner, where it failed with "Can't create
+;;;; directory /mnt/lisp".  A cache location is an operational preference; refusing to
+;;;; run without it turns a preference into a dependency.  LIBRARY-ROOT now asks
+;;;; whether the volume is there, and falls back to the ordinary cache directory.
 
 (in-package #:spool)
 
-(defparameter *library-root*
-  (pathname (or (uiop:getenv "SPOOL_ROOT") "/mnt/lisp/spool/"))
-  "Where subscriptions and cached audio live.  Deliberately not under $HOME — see
-the file header; episodes are big and this machine's root volume is not.")
+(defparameter *big-volume* #p"/mnt/lisp/spool/"
+  "Where the cache goes when that volume is actually there — see the file header.
+   A preference, not a requirement: it is where this machine keeps big things.")
 
-(defun %root () (ensure-directories-exist *library-root*))
+(defvar *library-root* nil
+  "Where subscriptions and cached audio live, or NIL to work it out per LIBRARY-ROOT.
+   Bind it to point somewhere else; SETF it to make that permanent.")
+
+(defun %writable-dir-p (path)
+  "Could we create PATH, or write into it if it already exists?  Asked rather than
+   assumed: the point of the default below is to notice when the big volume is not
+   mounted, and a PROBE-FILE on the directory we intend to create says nothing."
+  (handler-case
+      (progn (ensure-directories-exist path)
+             (let ((probe (merge-pathnames (format nil ".spool-write-~36r" (random (expt 2 40)))
+                                           path)))
+               (with-open-file (s probe :direction :output :if-exists :supersede)
+                 (write-char #\. s))
+               (delete-file probe)
+               t))
+    (error () nil)))
+
+(defun library-root ()
+  "Where the library lives.
+
+   WORKED OUT WHEN ASKED, not when this file was compiled.  The old definition read
+   SPOOL_ROOT with DEFPARAMETER, which is evaluated once — at LOAD time.  In a saved
+   core that is IMAGE-BUILD time, so the variable froze to whatever the environment
+   said on the build machine and the env var silently stopped working for everybody
+   who ran the core afterwards.  The same trap took GLASS_EARS and GLASS_VOICE.
+
+   The order is: what somebody set, then the big volume if it is really mounted and
+   writable, then the ordinary cache directory.  That last fallback is what was
+   missing: a 25-190 MB podcast cache belongs on the big volume where there is one,
+   but hard-coding it meant spool could not run at all on a machine without /mnt —
+   which is every machine except this one, including a CI runner."
+  (or *library-root*
+      (let ((env (uiop:getenv "SPOOL_ROOT")))
+        (and env (plusp (length env)) (pathname (%as-directory env))))
+      (and (%writable-dir-p *big-volume*) *big-volume*)
+      (merge-pathnames "spool/"
+                       (let ((xdg (uiop:getenv "XDG_CACHE_HOME")))
+                         (if (and xdg (plusp (length xdg)))
+                             (pathname (%as-directory xdg))
+                             (merge-pathnames ".cache/" (user-homedir-pathname)))))))
+
+(defun %as-directory (s)
+  "S with a trailing slash, so MERGE-PATHNAMES treats it as a directory rather than
+   as a file to be replaced.  A path typed without one is still a directory."
+  (if (and (plusp (length s)) (char= (char s (1- (length s))) #\/)) s (concatenate 'string s "/")))
+
+(defun %root () (ensure-directories-exist (library-root)))
 (defun %audio-dir () (ensure-directories-exist (merge-pathnames "audio/" (%root))))
 (defun %library-file () (merge-pathnames "library.sexp" (%root)))
 

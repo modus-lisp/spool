@@ -25,7 +25,7 @@
   (:use #:cl)
   (:local-nicknames (#:feed #:spool.feed) (#:xml #:spool.xml))
   (:export ;; library
-           #:*library-root* #:library #:load-library #:save-library
+           #:*library-root* #:library-root #:library #:load-library #:save-library
            #:subscriptions #:subscribe #:unsubscribe #:refresh #:refresh-all
            #:episodes #:find-episode #:position-of #:mark-position #:mark-played
            #:played-p

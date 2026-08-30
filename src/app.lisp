@@ -495,7 +495,7 @@ the report is on screen whether or not a show happens to be selected."
 (define-podcasts-command (com-cache-report :name "Cache") ()
   (multiple-value-bind (bytes files) (spool:cache-size)
     (%say clim:*application-frame* "~,1f GB in ~d file~:p at ~a"
-          (/ bytes 1073741824.0) files spool:*library-root*)))
+          (/ bytes 1073741824.0) files (spool:library-root))))
 
 (define-podcasts-command (com-tick) ()
   ;; Nothing: the frame's top level redisplays the panes after every command, so

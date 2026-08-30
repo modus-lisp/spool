@@ -145,7 +145,7 @@ point the RFB server calls."
           (shot "1-open"))
   (let ((feeds (spool:subscriptions)))
     (when (null feeds)
-      (format t "~&no subscriptions in ~a — nothing to drive.~%" spool:*library-root*)
+      (format t "~&no subscriptions in ~a — nothing to drive.~%" (spool:library-root))
       (return-from run))
 
     ;; 1. a show
