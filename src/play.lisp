@@ -41,7 +41,8 @@ phone call to every listener, which is the mistake glass's mixer exists to avoid
   (path nil)                            ; the cached file, or a file somebody named
   (bytes nil)                           ; the file, held so a seek needn't re-read it
   (reed nil)                            ; the reed player, or NIL between seeks
-  (state :idle)                         ; :idle :loading :playing :paused :ended :error
+  (state :idle)                         ; :idle :loading :buffering :playing :paused :ended :error
+  (radio nil)                           ; a RADIO (radio.lisp) while a live stream is playing
   (rate *play-rate* :type fixnum)
   (frame-samples *play-frame-samples* :type fixnum)
   (gain 1.0d0 :type double-float)
@@ -99,6 +100,7 @@ and never touched again."
         (setf (player-state p) :error
               (player-error p) (format nil "cannot read ~a" (file-namestring path))))
       (return-from play-file nil))
+    (%radio-stop p)
     (sb-thread:with-mutex ((player-lock p))
       (setf (player-state p) :loading
             (player-error p) nil
@@ -130,6 +132,7 @@ state honest."
       (setf (player-state p) :error
             (player-error p) "not downloaded")
       (return-from play nil))
+    (%radio-stop p)
     (sb-thread:with-mutex ((player-lock p))
       (setf (player-state p) :loading
             (player-error p) nil
@@ -152,7 +155,7 @@ state honest."
 
 (defun pause (p)
   (sb-thread:with-mutex ((player-lock p))
-    (when (eq (player-state p) :playing) (setf (player-state p) :paused)))
+    (when (member (player-state p) '(:playing :buffering)) (setf (player-state p) :paused)))
   ;; Persist on pause, not on the timer: this is the moment the user told us they
   ;; are stopping, and it is cheap because it happens once.
   (when (player-episode p)
@@ -161,19 +164,24 @@ state honest."
 
 (defun resume (p)
   (sb-thread:with-mutex ((player-lock p))
-    (when (member (player-state p) '(:paused :idle))
-      (when (player-reed p) (setf (player-state p) :playing))))
+    (cond ((player-radio p)
+           ;; A live stream has no place to resume FROM: what was buffered when the
+           ;; listener paused is minutes stale by now.  Drop it and rejoin the present.
+           (when (eq (player-state p) :paused) (%radio-rejoin p)))
+          ((member (player-state p) '(:paused :idle))
+           (when (player-reed p) (setf (player-state p) :playing)))))
   (player-state p))
 
 (defun toggle (p)
-  (if (eq (player-state p) :playing) (pause p) (resume p)))
+  (if (member (player-state p) '(:playing :buffering)) (pause p) (resume p)))
 
 (defun stop (p)
   (when (player-episode p)
     (ignore-errors (mark-position (player-episode p) (player-position p) :save t)))
+  (%radio-stop p)
   (sb-thread:with-mutex ((player-lock p))
     (setf (player-state p) :idle (player-reed p) nil (player-bytes p) nil
-          (player-episode p) nil (player-path p) nil
+          (player-episode p) nil (player-path p) nil (player-title p) nil
           (player-emitted p) 0 (player-base p) 0.0d0))
   :idle)
 
@@ -218,7 +226,9 @@ compute a byte offset from, and inventing a duration would scrub to a random pla
 episodes, pauses and seeks, because everything that changes is behind the closure."
   (lambda ()
     (handler-case
-        (sb-thread:with-mutex ((player-lock p))
+        (block radio-branch
+         (sb-thread:with-mutex ((player-lock p))
+          (when (player-radio p) (return-from radio-branch (%radio-frame p)))
           (when (and (eq (player-state p) :playing) (player-reed p))
             (let ((f (reed:player-next-frame (player-reed p))))
               (cond
@@ -235,7 +245,7 @@ episodes, pauses and seeks, because everything that changes is behind the closur
                      (let ((cb (player-on-end p)))
                        (sb-thread:make-thread (lambda () (ignore-errors (funcall cb p)))
                                               :name "spool-on-end")))
-                   nil)))))
+                   nil))))))
       (serious-condition (e)
         ;; A decode error is one silent frame and a state change, never a thrown
         ;; condition: this runs on the mixer's thread, and the mixer runs under

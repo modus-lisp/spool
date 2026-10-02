@@ -36,7 +36,7 @@
            #:player #:make-player #:player-p #:player-source #:player-episode #:player-title
            #:play-file
            #:player-state #:player-position #:player-duration #:player-error
-           #:play #:pause #:resume #:toggle #:stop #:seek #:skip #:next-episode
+           #:play #:play-url #:player-stream-title #:player-live-p #:player-station #:player-title #:pause #:resume #:toggle #:stop #:seek #:skip #:next-episode
            #:player-report))
 
 (defpackage #:spool.glass

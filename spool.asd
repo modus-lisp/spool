@@ -15,7 +15,8 @@ feed-shaped XML reader; audio is decoded incrementally by reed.  No FFI."
                              (:file "xml")
                              (:file "feed")
                              (:file "library")
-                             (:file "play")))))
+                             (:file "play")
+                             (:file "radio")))))
 
 (asdf:defsystem :spool/glass
   :description "spool's audio into a glass session mixer: the box plays the show, and
