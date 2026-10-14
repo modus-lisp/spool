@@ -18,6 +18,14 @@
 ;;;; skipped (its bytes are lost), so the window is topped up long before it runs dry
 ;;;; and playback goes to :buffering rather than decoding the last few KB.
 ;;;;
+;;;; DECODING IS ITS OWN THREAD.  The mixer used to decode in the source thunk -- reed's MP3
+;;;; decoder and its 44.1k->48k resampler, on the mixer's 20 ms clock, under the player lock --
+;;;; so the whole decode was billed to the thread every listener's audio waits on, and a slow
+;;;; moment there was a dropout for everyone at once.  A DECODER THREAD now runs the decode a
+;;;; few frames ahead into a PCM queue (*RADIO-DECODE-AHEAD*), and the thunk only pops a frame.
+;;;; It takes the player lock one frame at a time, so the mixer never waits longer than one
+;;;; frame's decode.
+;;;;
 ;;;; ICY metadata: we ask for it (Icy-MetaData: 1); the server then inserts a length
 ;;;; byte (x16) plus a "StreamTitle='...';" block after every METAINT audio bytes.  Those
 ;;;; bytes are NOT audio and are removed here, before the decoder sees anything.
@@ -32,6 +40,7 @@
 (defparameter *radio-resume-ahead* (* 16 1024))
 (defparameter *radio-max-redirects* 5)
 (defparameter *radio-max-attempts* 3 "connects that never deliver audio before giving up")
+(defparameter *radio-decode-ahead* 10 "decoded frames kept ready for the mixer (20 ms each)")
 
 (defstruct (radio (:constructor %make-radio))
   (url nil)
@@ -52,6 +61,9 @@
   (metaint nil)
   (connects 0 :type fixnum)
   (bytes-in 0 :type integer)
+  (pcm '())                             ; decoded frames ready for the mixer, oldest first
+  (pcm-n 0 :type fixnum)
+  (decoder nil)                         ; the decoder thread
   (player nil))
 
 ;;; ---- the queue --------------------------------------------------------------
@@ -151,14 +163,19 @@ otherwise discards what it examined and returns NIL, so the caller keeps bufferi
              (setf (reed::decoder-pos d) (max (reed::decoder-pos d) (- end 4)))
              (return nil))))
 
+(defun %radio-clear-pcm (r)
+  (setf (radio-pcm r) '() (radio-pcm-n r) 0))
+
 (defun %radio-rebuffer (p r)
+  (%radio-clear-pcm r)
   (%radio-fresh-reed p r)
   (setf (radio-buffering-since r) (get-internal-real-time)
         (player-state p) :buffering))
 
-(defun %radio-frame (p)
-  "One mixer frame of the live stream, or NIL.  Caller holds the player lock; this is
-the mixer thread, so nothing here may block."
+(defun %radio-produce (p)
+  "Decode one frame of the live stream, or NIL (buffering, underrun, nothing yet).  Runs
+on the DECODER thread with the player lock held; the state machine that turns buffering
+into playing and back lives here, with the decoding."
   (let ((r (player-radio p)))
     (when (and r (member (player-state p) '(:playing :buffering)))
       (%radio-topup r)
@@ -171,29 +188,57 @@ the mixer thread, so nothing here may block."
                                 (* 5 internal-time-units-per-second))))
                     (%radio-align r))
                (setf (player-state p) :playing)
-               (return-from %radio-frame nil)))
+               (return-from %radio-produce nil)))
           (:playing
            (when (< ahead *radio-underrun*)
              (setf (radio-buffering-since r) (get-internal-real-time)
                    (player-state p) :buffering)
-             (return-from %radio-frame nil)))))
+             (return-from %radio-produce nil)))))
       (let ((f (handler-case (reed:player-next-frame (radio-reed r))
                  ;; A damaged frame (a dropped span, a false sync) can make the decoder
                  ;; fault rather than refuse.  The decoder has already stepped past it,
                  ;; so one silent frame is the whole cost.
                  (error () :bad))))
         (cond ((eq f :bad) nil)
-              (f (incf (player-emitted p) (length f)) f)
+              (f f)
               (t ;; Garbage, not a real end — a live stream has none.  Start over.
                (%radio-rebuffer p r)
                nil))))))
+
+(defun %radio-frame (p)
+  "One mixer frame of the live stream, or NIL: the next DECODED frame, popped.  Caller holds
+the player lock; this is the mixer thread, so nothing here decodes or blocks.  The position
+counts here, at play time, not when the frame was decoded."
+  (let ((r (player-radio p)))
+    (when (and r (eq (player-state p) :playing) (radio-pcm r))
+      (let ((f (pop (radio-pcm r))))
+        (decf (radio-pcm-n r))
+        (incf (player-emitted p) (length f))
+        f))))
+
+(defun %radio-decode-loop (p r)
+  "The decoder thread: keep *RADIO-DECODE-AHEAD* frames ready until R is stopped."
+  (loop until (radio-stop r)
+        do (let ((made
+                   (handler-case
+                       (sb-thread:with-mutex ((player-lock p))
+                         (when (and (eq (player-radio p) r)
+                                    (< (radio-pcm-n r) *radio-decode-ahead*))
+                           (let ((f (%radio-produce p)))
+                             (when f
+                               (setf (radio-pcm r) (nconc (radio-pcm r) (list f)))
+                               (incf (radio-pcm-n r))
+                               t))))
+                     ;; nothing on this thread may end it: a bad moment is a skipped frame
+                     (serious-condition () nil))))
+             (unless made (sleep 0.005)))))
 
 (defun %radio-rejoin (p)
   "Drop everything buffered and rejoin the live edge.  Caller holds the player lock."
   (let ((r (player-radio p)))
     (when r
       (%radio-clear-queue r)
-      (%radio-rebuffer p r))))
+      (%radio-rebuffer p r))))   ; which clears the decoded frames too
 
 ;;; ---- the network ------------------------------------------------------------
 
@@ -384,7 +429,7 @@ the fetcher, which may itself want the lock to report a failure."
       (setf (radio-stop r) t)
       ;; The fetcher is usually parked in a read; closing the stream is what wakes it.
       (let ((s (radio-stream r))) (when s (ignore-errors (close s :abort t))))
-      (let ((th (radio-thread r)))
+      (dolist (th (list (radio-thread r) (radio-decoder r)))
         (when (and th (not (eq th sb-thread:*current-thread*)))
           (ignore-errors (sb-thread:join-thread th :default nil :timeout 2))))
       (sb-thread:with-mutex ((player-lock p))
@@ -412,7 +457,9 @@ fetcher thread and the state is :buffering until enough audio has arrived, then
       (%radio-fresh-reed p r)
       (setf (radio-buffering-since r) (get-internal-real-time)))
     (setf (radio-thread r)
-          (sb-thread:make-thread (lambda () (%radio-run r)) :name "spool-radio"))
+          (sb-thread:make-thread (lambda () (%radio-run r)) :name "spool-radio")
+          (radio-decoder r)
+          (sb-thread:make-thread (lambda () (%radio-decode-loop p r)) :name "spool-decode"))
     url))
 
 (defun player-live-p (p) (and (player-radio p) t))
