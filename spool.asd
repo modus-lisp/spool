@@ -31,3 +31,10 @@ window in the glass desktop."
   :depends-on ("spool/glass" "mcclim")
   :serial t
   :components ((:module "src" :serial t :components ((:file "app")))))
+
+(asdf:defsystem :spool/desk
+  :description "The client as a plain glass window — the window manager's MAKE-FN
+(SPOOL.DESK:PODCASTS-APP), drawn by hand into the window's framebuffer.  No McCLIM."
+  :depends-on ("spool/glass" "glass/text" "glass/clipboard")
+  :serial t
+  :components ((:module "src" :serial t :components ((:file "desk")))))
