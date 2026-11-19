@@ -36,7 +36,10 @@
 (defparameter *radio-decode-margin* (* 4 1024)
   "Bytes the worker keeps ahead of the decoder: a frame is decoded only once whole.")
 (defparameter *radio-align-ahead* (* 8 1024) "bytes in hand before the first frame is sought")
-(defparameter *radio-start-frames* 15 "frames waiting (20 ms each) before buffering becomes playing")
+;; 1 s, not 300 ms: a live stream arrives at exactly real time, so this is all the slack there is
+;; against the network (and the phone's speaker loop takes a cushion of frames at once on top).
+;; With 15, Groove Salad on the phone stopped and restarted every second or so.
+(defparameter *radio-start-frames* 50 "frames waiting (20 ms each) before buffering becomes playing")
 (defparameter *radio-max-frames* 250 "frames the player keeps at most (5 s); older ones are dropped")
 (defparameter *radio-max-redirects* 5)
 (defparameter *radio-max-attempts* 3 "connects that never deliver audio before giving up")
@@ -56,7 +59,12 @@
 
 (defstruct (rbox (:constructor %make-rbox))
   (lock (sb-thread:make-mutex :name "spool-radio-box"))
-  (items '()))
+  (items '())
+  ;; THE OUT BOX'S BACK-PRESSURE: frames the player has finished with (played, dropped, thrown away
+  ;; paused or on a rejoin), counted by the player's thread -- a fixnum, which any thread may store.
+  ;; The worker compares it with what it has posted and stops reading the socket while the player
+  ;; has a queue's worth waiting (see %W-PUMP).
+  (taken 0 :type fixnum))
 
 (defun %make-box () (%share (%make-rbox)))
 
@@ -86,17 +94,73 @@
   (player nil))
 
 (defun %radio-clear-pcm (r)
+  (incf (rbox-taken (radio-out r)) (radio-pcm-n r))
   (setf (radio-pcm r) '() (radio-pcm-n r) 0))
+
+;;; ---- what the stream is doing, for whoever asks (vessel's KILN_AUDIO_STATS) ------------------
+;;;
+;;; *RADIO-STATS*, when set, is a RADIO-STATS the caller made on the thread that ticks the mixer
+;;; (which is where %RADIO-DRAIN and %RADIO-FRAME run); they count into it, the caller reports and
+;;; resets it.  Unset, nothing is counted.
+
+(defstruct (radio-stats (:constructor make-radio-stats))
+  (in 0 :type fixnum)             ; frames the worker sent
+  (out 0 :type fixnum)            ; frames handed to the mixer
+  (waiting 0 :type fixnum)        ; mixer ticks answered with nothing while buffering
+  (rebuffers 0 :type fixnum)      ; playing -> buffering: the queue ran dry
+  (dropped 0 :type fixnum)        ; frames thrown away past *RADIO-MAX-FRAMES*
+  (qmin most-positive-fixnum :type fixnum) (qmax 0 :type fixnum)   ; queue depth after a frame went out
+  (dec-us 0 :type fixnum) (dec-max 0 :type fixnum)                 ; the worker's decode time a frame
+  (jump 0 :type fixnum)           ; largest step from one frame's last sample to the next's first
+  (last 0 :type fixnum)
+  (ms-min most-positive-fixnum :type fixnum) (ms-max 0 :type fixnum))  ; a frame's mean square
+
+(defvar *radio-stats* nil)
+
+(defun radio-stats-line (s)
+  "One line of S's counts."
+  (format nil "radio in ~D out ~D waiting ~D rebuffers ~D dropped ~D queue ~D..~D decode mean ~D us max ~D us, seam max ~D, rms ~D..~D"
+          (radio-stats-in s) (radio-stats-out s) (radio-stats-waiting s) (radio-stats-rebuffers s)
+          (radio-stats-dropped s)
+          (if (= (radio-stats-qmin s) most-positive-fixnum) -1 (radio-stats-qmin s)) (radio-stats-qmax s)
+          (floor (radio-stats-dec-us s) (max 1 (radio-stats-in s))) (radio-stats-dec-max s)
+          (radio-stats-jump s)
+          (if (= (radio-stats-ms-min s) most-positive-fixnum) -1 (isqrt (radio-stats-ms-min s)))
+          (isqrt (radio-stats-ms-max s))))
+
+(defun %radio-stats-out (s f q)
+  (incf (radio-stats-out s))
+  (setf (radio-stats-qmin s) (min (radio-stats-qmin s) q)
+        (radio-stats-qmax s) (max (radio-stats-qmax s) q))
+  (when (plusp (length f))
+    (setf (radio-stats-jump s) (max (radio-stats-jump s) (abs (- (aref f 0) (radio-stats-last s)))))
+    (setf (radio-stats-last s) (aref f (1- (length f))))
+    (let ((sum 0))
+      (declare (type fixnum sum))
+      (dotimes (i (length f)) (let ((x (aref f i))) (setf sum (+ sum (* x x)))))
+      (let ((ms (floor sum (length f))))
+        (setf (radio-stats-ms-min s) (min (radio-stats-ms-min s) ms)
+              (radio-stats-ms-max s) (max (radio-stats-ms-max s) ms))))))
 
 (defun %radio-drain (p r)
   "Take what the worker sent.  Caller holds the player lock."
   (dolist (m (%take (radio-out r)))
     (case (first m)
-      (:pcm (unless (eq (player-state p) :paused)
-              (setf (radio-pcm r) (nconc (radio-pcm r) (list (second m))))
-              (incf (radio-pcm-n r))
-              (when (> (radio-pcm-n r) *radio-max-frames*)
-                (pop (radio-pcm r)) (decf (radio-pcm-n r)))))
+      (:pcm (let ((s *radio-stats*))
+              (when s
+                (incf (radio-stats-in s))
+                (let ((us (or (third m) 0)))
+                  (incf (radio-stats-dec-us s) us)
+                  (setf (radio-stats-dec-max s) (max (radio-stats-dec-max s) us))))
+              (if (eq (player-state p) :paused)
+                  (incf (rbox-taken (radio-out r)))
+                  (progn
+                    (setf (radio-pcm r) (nconc (radio-pcm r) (list (second m))))
+                    (incf (radio-pcm-n r))
+                    (when (> (radio-pcm-n r) *radio-max-frames*)
+                      (pop (radio-pcm r)) (decf (radio-pcm-n r))
+                      (incf (rbox-taken (radio-out r)))
+                      (when s (incf (radio-stats-dropped s))))))))
       (:title (setf (radio-title r) (second m)))
       (:genre (setf (radio-genre r) (second m)))
       (:name (setf (radio-name r) (second m) (player-title p) (second m)))
@@ -113,15 +177,19 @@ the buffering state, and pops a frame.  The position counts here, at play time."
         (:buffering
          (when (>= (radio-pcm-n r) *radio-start-frames*)
            (setf (player-state p) :playing))
+         (when *radio-stats* (incf (radio-stats-waiting *radio-stats*)))
          nil)
         (:playing
          (if (null (radio-pcm r))
              (progn (setf (radio-buffering-since r) (get-internal-real-time)
                           (player-state p) :buffering)
+                    (when *radio-stats* (incf (radio-stats-rebuffers *radio-stats*)))
                     nil)
              (let ((f (pop (radio-pcm r))))
                (decf (radio-pcm-n r))
+               (incf (rbox-taken (radio-out r)))
                (incf (player-emitted p) (length f))
+               (when *radio-stats* (%radio-stats-out *radio-stats* f (radio-pcm-n r)))
                f)))))))
 
 (defun %radio-rejoin (p)
@@ -129,7 +197,8 @@ the buffering state, and pops a frame.  The position counts here, at play time."
   (let ((r (player-radio p)))
     (when r
       (%radio-clear-pcm r)
-      (%take (radio-out r))
+      ;; what the worker sent and nobody will play is finished with too
+      (incf (rbox-taken (radio-out r)) (count :pcm (%take (radio-out r)) :key #'first))
       (%post (radio-ctl r) (list :rejoin))
       (setf (radio-buffering-since r) (get-internal-real-time)
             (player-state p) :buffering))))
@@ -150,7 +219,8 @@ the buffering state, and pops a frame.  The position counts here, at play time."
   (aligned nil)
   (name nil)
   (connects 0 :type fixnum)
-  (bytes-in 0 :type integer))
+  (bytes-in 0 :type integer)
+  (posted 0 :type fixnum))              ; frames sent to the player (see RBOX-TAKEN)
 
 ;; %RADIO-OPEN (below, shared with nothing) records the open stream here, so a stop can close it.
 (defun (setf radio-stream) (v w) (setf (worker-stream w) v))
@@ -333,12 +403,16 @@ RADIO-FATAL for an answer that reconnecting cannot fix."
           (setf (worker-aligned w) t)
           (return)))
     (when (< (%w-ahead w) *radio-decode-margin*) (return))
-    (let ((f (handler-case (reed:player-next-frame (worker-reed w))
-               ;; a damaged frame (a dropped span, a false sync) can make the decoder fault
-               ;; rather than refuse; it has stepped past it, so one frame is the whole cost
-               (error () :bad))))
+    (let* ((t0 (get-internal-real-time))
+           (f (handler-case (reed:player-next-frame (worker-reed w))
+                ;; a damaged frame (a dropped span, a false sync) can make the decoder fault
+                ;; rather than refuse; it has stepped past it, so one frame is the whole cost
+                (error () :bad)))
+           ;; how long it took, in microseconds, for the player's stats
+           (us (floor (* 1000000 (- (get-internal-real-time) t0)) internal-time-units-per-second)))
       (cond ((eq f :bad))
-            (f (%post (worker-out w) (list :pcm (%shared-copy f))))
+            (f (%post (worker-out w) (list :pcm (%shared-copy f) us))
+               (incf (worker-posted w)))
             (t (%w-fresh-reed w) (return))))))   ; garbage, not a real end: start over
 
 (defun %w-feed (w buf n)
@@ -363,7 +437,15 @@ RADIO-FATAL for an answer that reconnecting cannot fix."
         (meta (make-array 4096 :element-type '(unsigned-byte 8)))
         (left (or metaint most-positive-fixnum)))
     (loop until (progn (%w-control w) (worker-stop w))
-          do (let ((n (min 2048 left)))
+          do ;; BACK-PRESSURE: while the player has nearly a full queue waiting, read nothing, and let
+             ;; TCP hold the server back.  An Icecast server sends many seconds at once on connect
+             ;; (SomaFM: 16 s in the first 30); decoded as fast as it came, it overflowed the queue,
+             ;; whose oldest frames were dropped -- cut out of what was playing, thirty times a second.
+             (loop while (and (not (worker-stop w))
+                              (>= (- (worker-posted w) (rbox-taken (worker-out w)))
+                                  (- *radio-max-frames* 25)))
+                   do (sleep 0.02) (%w-control w))
+             (let ((n (min 2048 left)))
                (when (plusp n)
                  (let ((got (read-sequence buf stream :end n)))
                    (when (zerop got) (return))
