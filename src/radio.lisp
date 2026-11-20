@@ -522,6 +522,15 @@ RADIO-FATAL for an answer that reconnecting cannot fix."
     (when r (%post (radio-ctl r) (list :stop)))
     r))
 
+;;; The station's worker holds a 256 KB window and a decoder: a small heap is plenty, and on a phone
+;;; whose world gives page workers 64 MB regions it should not take one of those.  Where modus lays its
+;;; regions out by size (SB-THREAD:MAKE-THREAD :HEAP-BYTES) it asks for 16 MB; elsewhere -- SBCL, an
+;;; older modus -- there is no such argument and nothing is passed.
+(defparameter *radio-heap-bytes* (* 16 1024 1024))
+(defun %radio-heap-args ()
+  #+modus (and (find-symbol "*%THREAD-HEAP-WANT*" "MODUS-INT") (list :heap-bytes *radio-heap-bytes*))
+  #-modus nil)
+
 (defun play-url (p url &key name)
   "Play the live MP3 stream at URL on P.  Returns at once: the connection is made on the
 station's own thread and the state is :buffering until enough audio has arrived, then
@@ -542,10 +551,11 @@ station's own thread and the state is :buffering until enough audio has arrived,
             (player-base p) 0.0d0
             (radio-buffering-since r) (get-internal-real-time)))
     (setf (radio-thread r)
-          (sb-thread:make-thread #'%radio-worker
-                                 :arguments (list (%share url) (player-rate p) (player-frame-samples p)
-                                                  (player-gain p) (radio-ctl r) (radio-out r))
-                                 :name "spool-radio"))
+          (apply #'sb-thread:make-thread #'%radio-worker
+                 :arguments (list (%share url) (player-rate p) (player-frame-samples p)
+                                  (player-gain p) (radio-ctl r) (radio-out r))
+                 :name "spool-radio"
+                 (%radio-heap-args)))
     url))
 
 (defun player-live-p (p) (and (player-radio p) t))
