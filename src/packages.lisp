@@ -3,7 +3,7 @@
 ;;;; Split by what each layer knows about.  SPOOL.XML knows about angle brackets and
 ;;;; nothing else; SPOOL.FEED knows what a podcast feed means and nothing about where
 ;;;; the bytes came from; SPOOL knows about the library on disk and playback.  The
-;;;; CLIM app lives in SPOOL.APP and is the only package that has heard of a screen.
+;;;; window is spool/desk's SPOOL.DESK (a plain glass window), the only package that has heard of a screen.
 
 (defpackage #:spool.xml
   (:use #:cl)

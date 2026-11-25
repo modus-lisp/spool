@@ -25,13 +25,6 @@ every listener the session has — a VNC viewer, a WebRTC peer — hears it."
   :serial t
   :components ((:module "src" :serial t :components ((:file "glass")))))
 
-(asdf:defsystem :spool/app
-  :description "The CLIM application: subscriptions, episodes and a transport, as a
-window in the glass desktop."
-  :depends-on ("spool/glass" "mcclim")
-  :serial t
-  :components ((:module "src" :serial t :components ((:file "app")))))
-
 (asdf:defsystem :spool/desk
   :description "The client as a plain glass window — the window manager's MAKE-FN
 (SPOOL.DESK:PODCASTS-APP), drawn by hand into the window's framebuffer.  No McCLIM."
